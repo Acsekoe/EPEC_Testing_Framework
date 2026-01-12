@@ -31,7 +31,7 @@ if __name__ == "__main__":
         "damping": 0.8,
         "price_sign": -1.0,
         "eps_pen": 1e-8,
-        "eps_reg": 1e-6,   # start here; later try 1e-7, 1e-8
+        "eps_reg": 1e-8,   # start here; later try 1e-7, 1e-8
         "M_dual": 1e6,
         #"kkt_mode": "bigM",     # robust (MIQP)
         "kkt_mode": "bilinear", # no binaries, but nonconvex bilinear equalities
