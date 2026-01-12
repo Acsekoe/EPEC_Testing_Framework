@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 import pyomo.environ as pyo
+from pyomo.common.errors import ApplicationError
 from pyomo.opt import SolverStatus, TerminationCondition
 
 from epec.core.sets import Sets
@@ -138,14 +139,28 @@ def solve_gauss_seidel(
     solver_name: str = "gurobi_direct",
     gurobi_options: Dict[str, float] | None = None,
     verbose: bool = True,
-    run_cfg: Dict[str, float] | None = None,
+    run_cfg: Dict[str, Any] | None = None,
 ) -> Tuple[Theta, List[dict]]:
     """
-    Gauss-Seidel over players. Each player solves a (nonconvex) MIQP (because lam * x_flow)
-    with exact Big-M complementarity constraints in the embedded KKT system.
+    Gauss-Seidel over players.
 
-    Requires Gurobi with NonConvex=2.
+    Solver requirements depend on `kkt_mode`:
+      - `bigM`: MIP/MIQP solver (typically Gurobi).
+      - `bilinear`: NLP/QCP-capable solver (Ipopt or Gurobi with NonConvex=2).
     """
+
+    def _get_first_available_solver(names: List[str]):
+        tried: List[str] = []
+        for name in names:
+            tried.append(name)
+            s = pyo.SolverFactory(name)
+            if s is not None and s.available(exception_flag=False):
+                return s
+        raise ApplicationError(
+            "No executable found for solver(s): "
+            + ", ".join(tried)
+            + ". Install a supported solver (e.g., Gurobi/Ipopt) or set run_cfg['solver_name']."
+        )
 
     if run_cfg:
         max_iter = int(run_cfg.get("max_iter", max_iter))
@@ -158,21 +173,48 @@ def solve_gauss_seidel(
         kkt_mode = str(run_cfg.get("kkt_mode", kkt_mode))
         use_shortage_slack = bool(run_cfg.get("use_shortage_slack", use_shortage_slack))
         solver_name = str(run_cfg.get("solver_name", run_cfg.get("solver", solver_name)))
+        gurobi_options = run_cfg.get("gurobi_options", gurobi_options)
+        solver_options = run_cfg.get("solver_options", run_cfg.get("solver_opts", None))
+    else:
+        solver_options = None
 
     theta = theta0.copy()
 
-    solver = pyo.SolverFactory(solver_name)
-    if solver is None or not solver.available(exception_flag=False):
-        solver = pyo.SolverFactory("gurobi")
-    # critical: bilinear objective lam * x_flow -> nonconvex quadratic
-    solver.options["NonConvex"] = 2
-    solver.options["OutputFlag"] = 1 if verbose else 0
-    solver.options["MIPGap"] = 1e-6
-    solver.options["FeasibilityTol"] = 1e-8
-    solver.options["OptimalityTol"] = 1e-8
+    kkt_mode_l = kkt_mode.strip().lower()
+
+    # Pick a sensible default if the caller didn't override the solver:
+    # - `bilinear` is typically solved with Ipopt (or Gurobi NonConvex QCP).
+    # - `bigM` requires a MIP/MIQP solver (Gurobi default).
+    if kkt_mode_l == "bilinear" and solver_name == "gurobi_direct":
+        solver_name = "ipopt"
+
+    candidate_solvers: List[str]
+    if kkt_mode_l == "bigm":
+        candidate_solvers = [solver_name, "gurobi_direct", "gurobi"]
+    else:
+        candidate_solvers = [solver_name, "ipopt", "gurobi_direct", "gurobi"]
+
+    # de-duplicate while preserving order
+    seen = set()
+    candidate_solvers = [s for s in candidate_solvers if not (s in seen or seen.add(s))]
+
+    solver = _get_first_available_solver(candidate_solvers)
+
+    solver_name_l = str(getattr(solver, "name", solver_name)).lower()
+    if solver_name_l.startswith("gurobi"):
+        # critical: bilinear objective lam * x_flow -> nonconvex quadratic
+        solver.options["NonConvex"] = 2
+        solver.options["OutputFlag"] = 1 if verbose else 0
+        solver.options["MIPGap"] = 1e-6
+        solver.options["FeasibilityTol"] = 1e-8
+        solver.options["OptimalityTol"] = 1e-8
 
     if gurobi_options:
         for k, v in gurobi_options.items():
+            solver.options[k] = v
+
+    if isinstance(solver_options, dict):
+        for k, v in solver_options.items():
             solver.options[k] = v
 
     hist: List[dict] = []

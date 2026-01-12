@@ -1,0 +1,8 @@
+{
+  "python.defaultInterpreterPath": "${env:USERPROFILE}\\.venvs\\EEG_EPEC\\Scripts\\python.exe",
+  "python.terminal.activateEnvironment": true,
+  "python.analysis.extraPaths": ["${workspaceFolder}\\src"],
+  "terminal.integrated.env.windows": {
+    "PYTHONPATH": "${workspaceFolder}\\src"
+  }
+}
