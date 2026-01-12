@@ -26,8 +26,8 @@ if __name__ == "__main__":
 
     # ---- run config (single source of truth) ----
     run_cfg = {
-        "max_iter": 10,
-        "tol": 1e-4,
+        "max_iter": 50,
+        "tol": 1e-2,
         "damping": 0.8,
         "price_sign": -1.0,
         "eps_pen": 1e-8,

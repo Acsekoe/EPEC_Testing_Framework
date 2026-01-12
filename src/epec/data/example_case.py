@@ -66,7 +66,7 @@ def make_example():
     # Assumptions (placeholders)
     # -----------------------------
     # Manufacturing costs (arbitrary, keep your old toy ordering)
-    c_mod_man = {"ch": 5.0, "eu": 6.0, "us": 9.0}
+    c_mod_man = {"ch": 5.0, "eu": 6.0, "us": 1.0}
 
     # Domestic-use cost (tiny, just to keep x_dom meaningful)
     c_mod_dom_use = {r: 0.2 for r in R}
@@ -83,7 +83,7 @@ def make_example():
     s_ship[("us", "ch")] = 10.0
 
     # Penalties (placeholders; your model behavior will be very sensitive to these!)
-    c_pen_llp = {r: 1000.0 for r in R}
+    c_pen_llp = {r: 1000.0 for r in R} #not used anymore
     c_pen_ulp = {r: 1500.0 for r in R}
     c_dem_short_ulp = {"ch": 1200.0, "eu": 1200.0, "us": 1200.0}
 
