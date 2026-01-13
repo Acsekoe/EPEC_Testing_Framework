@@ -65,7 +65,6 @@ def _print_player_block(it: int, player: str, m: pyo.ConcreteModel, sets: Sets) 
 
     lam = {r: _val(m.lam[r]) for r in R} if hasattr(m, "lam") else {}
     pi = {r: _val(m.pi[r]) for r in R} if hasattr(m, "pi") else {}
-    # alp removed in reformulation
 
     mu_man = {r: _val(m.mu_man[r]) for r in R} if hasattr(m, "mu_man") else {}
     nu_ushort = {r: _val(m.nu_ushort[r]) for r in R} if hasattr(m, "nu_ushort") else {}
@@ -78,7 +77,6 @@ def _print_player_block(it: int, player: str, m: pyo.ConcreteModel, sets: Sets) 
     if hasattr(m, "prod_balance"):
         for r in R:
             prod_res[r] = _val(m.prod_balance[r].body)
-    # no dem_link in reformulation
 
     sep = "-" * 78
     print(sep)
@@ -122,7 +120,6 @@ def _print_player_block(it: int, player: str, m: pyo.ConcreteModel, sets: Sets) 
         print("  mod_balance:", _fmt_map(mod_res, key_order=R, width=12, prec=3))
     if prod_res:
         print("  prod_balance:", _fmt_map(prod_res, key_order=R, width=12, prec=3))
-    # no dem_link in reformulation
 
     print(sep)
 
@@ -137,6 +134,7 @@ def solve_gauss_seidel(
     price_sign: float = -1.0,
     eps_pen: float = 1e-8,  # kept for backwards compatibility (unused in new formulation)
     eps_reg: float = 1e-6,
+    eps_price_reg: float = 0.5,  # NEW: price anchoring strength (pass through to player MPEC)
     M_dual: float = 1e6,
     kkt_mode: str = "bigM",
     use_shortage_slack: bool = True,
@@ -147,6 +145,14 @@ def solve_gauss_seidel(
 ) -> Tuple[Theta, List[dict]]:
     """
     Gauss-Seidel over players.
+
+    Stopping criterion (FIXED):
+      Uses a *normalized* infinity-norm change over strategic vars:
+        d_offer scaled by D_hat
+        q_man   scaled by Q_man_hat
+        tau     scaled by (tau_ub-1)
+        markup  scaled by m_ub
+      Stop when max normalized change < tol for `conv_required` consecutive outer iterations.
 
     Solver requirements depend on `kkt_mode`:
       - `bigM`: MIP/MIQP solver (typically Gurobi).
@@ -166,6 +172,7 @@ def solve_gauss_seidel(
             + ". Install a supported solver (e.g., Gurobi/Ipopt) or set run_cfg['solver_name']."
         )
 
+    # ---- pull overrides from run_cfg
     if run_cfg:
         max_iter = int(run_cfg.get("max_iter", max_iter))
         tol = float(run_cfg.get("tol", tol))
@@ -173,27 +180,26 @@ def solve_gauss_seidel(
         price_sign = float(run_cfg.get("price_sign", price_sign))
         eps_pen = float(run_cfg.get("eps_pen", eps_pen))
         eps_reg = float(run_cfg.get("eps_reg", eps_reg))
+        eps_price_reg = float(run_cfg.get("eps_price_reg", eps_price_reg))
         M_dual = float(run_cfg.get("M_dual", M_dual))
         kkt_mode = str(run_cfg.get("kkt_mode", kkt_mode))
         use_shortage_slack = bool(run_cfg.get("use_shortage_slack", use_shortage_slack))
         solver_name = str(run_cfg.get("solver_name", run_cfg.get("solver", solver_name)))
         gurobi_options = run_cfg.get("gurobi_options", gurobi_options)
         solver_options = run_cfg.get("solver_options", run_cfg.get("solver_opts", None))
+        conv_required = int(run_cfg.get("conv_required", 3))
     else:
         solver_options = None
+        conv_required = 3
 
     theta = theta0.copy()
-
     kkt_mode_l = kkt_mode.strip().lower()
 
-    # Pick a sensible default if the caller didn't override the solver:
-    # - `bilinear` is typically solved with Ipopt (or Gurobi NonConvex QCP).
-    # - `bigM` requires a MIP/MIQP solver (Gurobi default).
+    # Pick sensible default:
     if kkt_mode_l == "bilinear" and solver_name == "gurobi_direct":
         solver_name = "ipopt"
 
-    candidate_solvers: List[str]
-    if kkt_mode_l == "bigm":
+    if kkt_mode_l in ("bigm", "big_m", "big-m"):
         candidate_solvers = [solver_name, "gurobi_direct", "gurobi"]
     else:
         candidate_solvers = [solver_name, "ipopt", "gurobi_direct", "gurobi"]
@@ -206,8 +212,7 @@ def solve_gauss_seidel(
 
     solver_name_l = str(getattr(solver, "name", solver_name)).lower()
     if solver_name_l.startswith("gurobi"):
-        # critical: bilinear objective lam * x_flow -> nonconvex quadratic
-        solver.options["NonConvex"] = 2
+        solver.options["NonConvex"] = 2  # allow nonconvex QP/QCP if present
         solver.options["OutputFlag"] = 1 if verbose else 0
         solver.options["MIPGap"] = 1e-6
         solver.options["FeasibilityTol"] = 1e-8
@@ -221,36 +226,49 @@ def solve_gauss_seidel(
         for k, v in solver_options.items():
             solver.options[k] = v
 
+    # ---- normalized change helpers (FIXED stopping logic)
+    def _rel_change_scalar(delta: float, scale: float) -> float:
+        scale = max(1.0, float(scale))
+        return abs(float(delta)) / scale
+
+    def _rel_change_tau(delta: float, e: str, rr: str) -> float:
+        rng = float(params.tau_ub[(e, rr)] - 1.0)
+        rng = max(1e-6, rng)
+        return abs(float(delta)) / rng
+
+    def _rel_change_markup(delta: float, e: str, rr: str) -> float:
+        ub = float(params.m_ub[(e, rr)])
+        ub = max(1.0, ub)
+        return abs(float(delta)) / ub
+
     hist: List[dict] = []
     iters_done = 0
+    conv_streak = 0
 
     for it in range(max_iter):
         max_change = 0.0
 
         for r in sets.R:
             m = build_player_mpec(
-                r, sets, params, theta,
+                r,
+                sets,
+                params,
+                theta,
                 price_sign=price_sign,
                 eps_reg=eps_reg,
+                eps_price_reg=eps_price_reg,  # IMPORTANT: pass through
                 M_dual=M_dual,
                 kkt_mode=kkt_mode,
                 use_shortage_slack=use_shortage_slack,
             )
 
             res = solver.solve(m, tee=False, load_solutions=False)
-
             status = res.solver.status
             tc = res.solver.termination_condition
 
-            ok = (status == SolverStatus.ok) and (tc in (
-                TerminationCondition.optimal,
-                TerminationCondition.locallyOptimal,
-            ))
-
+            ok = (status == SolverStatus.ok) and (tc in (TerminationCondition.optimal, TerminationCondition.locallyOptimal))
             if not ok:
-                hist.append(
-                    {"iter": it, "region": r, "accepted": False, "status": str(status), "term": str(tc)}
-                )
+                hist.append({"iter": it, "region": r, "accepted": False, "status": str(status), "term": str(tc)})
                 if verbose:
                     print(f"[iter {it:>2}] player={r}  SOLVE FAILED  status={status} term={tc}")
                 continue
@@ -277,7 +295,7 @@ def solve_gauss_seidel(
                 _print_player_block(it=it, player=r, m=m, sets=sets)
 
             # ---- Best response (Gauss-Seidel update)
-            br_q_man_r   = _val(m.q_man[r])
+            br_q_man_r = _val(m.q_man[r])
             br_d_offer_r = _val(m.d_offer[r])
 
             # inbound tariffs (chosen by importer r)
@@ -289,25 +307,28 @@ def solve_gauss_seidel(
             def upd(old, new):
                 return old + damping * (new - old)
 
-            # update player scalars
+            # update player scalars (normalized change)
             old_q, old_d = theta.q_man[r], theta.d_offer[r]
-            theta.q_man[r]   = upd(theta.q_man[r], br_q_man_r)
-            theta.d_offer[r] = upd(theta.d_offer[r], br_d_offer_r)
+            theta.q_man[r] = upd(old_q, br_q_man_r)
+            theta.d_offer[r] = upd(old_d, br_d_offer_r)
 
-            max_change = max(max_change, abs(theta.q_man[r] - old_q), abs(theta.d_offer[r] - old_d))
+            max_change = max(
+                max_change,
+                _rel_change_scalar(theta.q_man[r] - old_q, params.Q_man_hat[r]),
+                _rel_change_scalar(theta.d_offer[r] - old_d, params.D_hat[r]),
+            )
 
-            # update inbound taus into r
+            # update inbound taus into r (normalized change by range)
             for (e, rr), newv in br_tau_in.items():
                 oldv = theta.tau[(e, rr)]
                 theta.tau[(e, rr)] = upd(oldv, newv)
-                max_change = max(max_change, abs(theta.tau[(e, rr)] - oldv))
+                max_change = max(max_change, _rel_change_tau(theta.tau[(e, rr)] - oldv, e, rr))
 
-            # update outbound markups from r
+            # update outbound markups from r (normalized change by ub)
             for (e, i), newv in br_m_out.items():
                 oldv = theta.markup[(e, i)]
                 theta.markup[(e, i)] = upd(oldv, newv)
-                max_change = max(max_change, abs(theta.markup[(e, i)] - oldv))
-
+                max_change = max(max_change, _rel_change_markup(theta.markup[(e, i)] - oldv, e, i))
 
             # ---- Store history row (Excel)
             hist.append(
@@ -326,29 +347,33 @@ def solve_gauss_seidel(
                     "max_u_short": max_u_short_val,
                     "x_man": x_man_vals,
                     "x_flow": x_flow_vals,
-                    "br_q_man": br_q_man_r,
-                    "br_d_offer": br_d_offer_r,
-                    "br_tau_in": {k: br_tau_in[k] for k in br_tau_in},
-                    "br_m_out": {k: br_m_out[k] for k in br_m_out},
-                    "theta_q_man": dict(theta.q_man),
-                    "theta_d_offer": dict(theta.d_offer),
-                    "theta_tau": dict(theta.tau),
-                    "theta_markup": dict(theta.markup),
                     "br_q_man": float(br_q_man_r),
                     "br_d_offer": float(br_d_offer_r),
                     "br_tau_in": dict(br_tau_in),   # {(e,r): val} inbound for this player
                     "br_m_out": dict(br_m_out),     # {(r,i): val} outbound for this player
-
+                    "theta_q_man": dict(theta.q_man),
+                    "theta_d_offer": dict(theta.d_offer),
+                    "theta_tau": dict(theta.tau),
+                    "theta_markup": dict(theta.markup),
+                    "gs_max_change_norm": float(max_change),
+                    "eps_price_reg": float(eps_price_reg),
                 }
             )
 
         iters_done = it + 1
         if verbose:
-            print(f"\n=== end GS iter {it}: max_change={max_change:.6g} (tol={tol}) ===")
+            print(f"\n=== end GS iter {it}: max_change_norm={max_change:.6g} (tol={tol}, streak={conv_streak}/{conv_required}) ===")
 
+        # ---- consecutive convergence requirement
         if max_change < tol:
+            conv_streak += 1
+        else:
+            conv_streak = 0
+
+        if conv_streak >= conv_required:
             break
 
     if verbose:
-        print(f"\n=== Gauss-Seidel finished: {iters_done} iteration(s) executed ===")
+        print(f"\n=== Gauss-Seidel finished: {iters_done} iteration(s) executed | conv_streak={conv_streak}/{conv_required} ===")
+
     return theta, hist

@@ -6,85 +6,104 @@ from epec.core.theta import theta_init_from_bounds
 
 
 def make_example():
-    """Small stylized 3-region example.
+    """3-region example with realistic-ish manufacturing costs and trade logistics.
 
-    This example is intentionally simple. It implements the **Option B** semantics:
+    Option B:
+      - tau_{e->r} is a multiplicative factor on shipping only (in LLP objective)
+      - markup m_{e->r} is additive offer premium on trade arcs (in LLP objective)
 
-    - Import tariff is a **multiplicative factor** \tau_{e->r} applied to *shipping only* in the LLP.
-    - The tariff wedge collected by the importer is:
-        \Delta^{tar}_{e->r} = (\tau_{e->r}-1) * s^{ship}_{e,r}
-    - Exporters choose nonnegative additive markups m_{e->r} (entering LLP imports offer term).
-
-    The rates below are toy values to create asymmetry.
+    Data sources (from Input_Data_Overview.xlsx):
+      - Manufacturing proxy: Avg module prices (USD/kW)
+      - Shipping: TradeLogistics avg USD/container divided by 260.4 kW/container
     """
 
-    # regions
     regions = ["ch", "eu", "us"]
     sets = build_sets(regions)
     R, RR = sets.R, sets.RR
 
-    # Demand (GW)
-    D_hat = {
-        "ch": 293.0,
-        "eu": 321.0,
-        "us": 86.0,
-    }
+    # Demand (GW)  (keep your stylized values for now)
+    D_hat = {"ch": 293.0, "eu": 321.0, "us": 86.0}
 
-    # Production capacity (GW)
-    Q_man_hat = {
-        "ch": 931.0,
-        "eu": 22.0,
-        "us": 23.0,
-    }
+    # Production capacity (GW) (keep your stylized values for now)
+    Q_man_hat = {"ch": 931.0, "eu": 22.0, "us": 23.0}
 
-    # Toy ad-valorem tariff rates (decimal). We map them to a multiplicative upper bound:
-    #   tau_ub = 1 + rate
-    tau_pct = {
-        ("ch", "eu"): 0.0,
-        ("ch", "us"): 0.50,
+    # ----------------------------
+    # Realistic cost magnitudes
+    # ----------------------------
+    # Manufacturing cost proxy (USD/kW) from Avg Module Prices (USD/W)*1000
+    c_mod_man = {"ch": 163.00, "eu": 299.25, "us": 321.25}
+
+    # Domestic-use friction (USD/kW). If you don’t want it, set to 0.0.
+    # Keep it small vs manufacturing.
+    c_mod_dom_use = {r: 3.0 for r in R}
+
+    # Shipping/logistics (USD/kW), avg case (USD/container / 260.4 kW/container)
+    # Directed arcs e->r
+    s_ship = {(e, r): 0.0 for (e, r) in RR}  # will overwrite all RR arcs
+    s_ship.update(
+        {
+            ("ch", "eu"): 16.118,
+            ("ch", "us"): 11.133,
+            ("eu", "ch"): 16.118,
+            ("eu", "us"): 18.760,
+            ("us", "ch"): 24.731,
+            ("us", "eu"): 9.397,
+        }
+    )
+
+    # ----------------------------
+    # Tariff-factor bounds (tau_ub)
+    # ----------------------------
+    # tau = 1 + rate. Since tau is a decision var in the ULP, these are *upper bounds*.
+    # Pick plausible “policy space” bounds (you can tighten/loosen later).
+    tau_rate_ub = {
+        ("ch", "eu"): 0.10,   # EU can charge up to 10% on CH imports (as an upper bound)
+        ("ch", "us"): 0.25,   # US up to 25% on CH
         ("eu", "ch"): 0.10,
-        ("eu", "us"): 0.1425,
+        ("eu", "us"): 0.05,
         ("us", "ch"): 0.10,
-        ("us", "eu"): 0.0,
+        ("us", "eu"): 0.05,
     }
     for (e, r) in RR:
-        tau_pct.setdefault((e, r), 0.05)
+        tau_rate_ub.setdefault((e, r), 0.05)
+    tau_ub = {(e, r): 1.0 + float(tau_rate_ub[(e, r)]) for (e, r) in RR}
 
-    tau_ub = {(e, r): 1.0 + float(tau_pct[(e, r)]) for (e, r) in RR}
+    # ----------------------------
+    # Markup bounds (USD/kW)
+    # ----------------------------
+    # Markup should be “big enough” to allow strategic pricing but not absurd.
+    # Relative to costs (163–321 + shipping ~ 10–25), 0..200 is already huge.
+    m_ub = {(e, r): 200.0 for (e, r) in RR}
 
-    # Markup bounds (toy, but you should set these based on economic reasoning / scaling)
-    m_ub = {(e, r): 500 for (e, r) in RR}
+    # LLP shortage penalty (only relevant if you enable shortage slack)
+    c_pen_llp = {r: 5000.0 for r in R}
 
-    # Manufacturing costs (arbitrary, keep your old toy ordering)
-    c_mod_man = {"ch": 5.0, "eu": 6.0, "us": 7.0}
+    # ----------------------------
+    # Elastic demand calibration
+    # ----------------------------
+    # Choose p0 around “typical delivered cost” scale (USD/kW) and a choke price.
+    # This keeps the demand response in a realistic range.
+    p0 = {"ch": 220.0, "eu": 320.0, "us": 260.0}         # roughly aligns with local supply costs
+    p_choke = {"ch": 1200.0, "eu": 1200.0, "us": 1200.0}  # demand ~0 at very high price
 
-    # Domestic-use cost (tiny, just to keep x_dom meaningful)
-    c_mod_dom_use = {r: 0.2 for r in R}
+    a_dem = {r: float(p_choke[r]) for r in R}
+    b_dem = {r: float(p_choke[r] - p0[r]) / float(D_hat[r]) for r in R}
 
-    # Shipping cost matrix (ASSUMED)
-    base = 99.0
-    s_ship = {(e, r): base for (e, r) in RR}
-    s_ship[("eu", "us")] = 5.0
-    s_ship[("us", "eu")] = 5.0
-    s_ship[("ch", "eu")] = 8.0
-    s_ship[("eu", "ch")] = 8.0
-    s_ship[("ch", "us")] = 10.0
-    s_ship[("us", "ch")] = 10.0
-
-    # Penalties (placeholders; behavior is sensitive to these!)
-    c_pen_llp = {r: 1500 for r in R}  # only used if shortage slack enabled
-    c_pen_ulp = {r: 1500 for r in R}
+    # (Optional legacy, not used with elastic demand)
+    c_pen_ulp = {r: 1500.0 for r in R}
 
     params = Params(
         c_mod_man=c_mod_man,
         c_mod_dom_use=c_mod_dom_use,
         s_ship=s_ship,
         c_pen_llp=c_pen_llp,
-        c_pen_ulp=c_pen_ulp,
         D_hat=D_hat,
         Q_man_hat=Q_man_hat,
         tau_ub=tau_ub,
         m_ub=m_ub,
+        a_dem=a_dem,
+        b_dem=b_dem,
+        c_pen_ulp=c_pen_ulp,
     )
 
     theta0 = theta_init_from_bounds(R, RR, params)

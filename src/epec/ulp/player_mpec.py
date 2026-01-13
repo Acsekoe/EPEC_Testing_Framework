@@ -17,28 +17,15 @@ def build_player_mpec(
     *,
     kkt_mode: str = "bigM",
     eps_reg: float = 1e-7,
-    eps_price_reg: float = 0.5,  # <--- NEW: price anchoring strength (start tiny)
+    eps_price_reg: float = 0.5,   # keep 0 to disable; set >0 if you want the anchoring
     M_dual: float = 1e6,
-    use_shortage_slack: bool = True,
+    use_shortage_slack: bool = False,
     price_sign: float = -1.0,
 ) -> pyo.ConcreteModel:
-    """Build the single-player MPEC (ULP_r + embedded LLP-KKT), Option B.
+    """Build the single-player MPEC (ULP_r + embedded LLP-KKT), Option B + elastic demand.
 
-    Player r controls:
-      - d_offer[r] in [0, D_hat[r]]
-      - q_man[r]   in [0, Q_man_hat[r]]
-      - inbound tariff factors tau[e->r] for all e!=r, with 1 <= tau <= tau_ub
-      - outbound markups markup[r->i] for all i!=r, with 0 <= markup <= m_ub
-
-    All other players' strategic variables are fixed at theta_fixed.
-
-    Market price in region i is the dual of (MB):  p_i := price_sign * lam[i].
-
-    Price anchoring (Fix A):
-      Adds a tiny penalty to keep prices close to a baseline reference level
-      p_ref[i] := c_mod_man[i] + c_mod_dom_use[i].
-      This prevents the leader from exploiting follower dual non-uniqueness to
-      push lam (and thus prices) to extreme values unrelated to primal costs.
+    Elastic demand:
+      U_r(d) = a_dem[r]*d - 0.5*b_dem[r]*d^2
     """
 
     r = region
@@ -109,10 +96,6 @@ def build_player_mpec(
     # Deactivate LLP objective; solve leader objective with KKT constraints
     m.LLP_OBJ.deactivate()
 
-    # ---- Linearize (D_hat - d_offer[r]) (always >=0 due to ub, but keeps things explicit)
-    m.dem_short = pyo.Var(within=pyo.NonNegativeReals)
-    m.dem_short_lb = pyo.Constraint(expr=m.dem_short >= params.D_hat[r] - m.d_offer[r])
-
     # ---- Helper: tariff wedge Delta^{tar}_{e->dest} = (tau-1)*s_ship on trade arcs
     def _delta_tar(e: str, dest: str):
         return (m.tau[e, dest] - 1.0) * m.s_ship[e, dest]
@@ -120,32 +103,30 @@ def build_player_mpec(
     # ---- Prices (buyer prices)
     p = {i: price_sign * m.lam[i] for i in R}
 
-    # ---- ULP objective (LaTeX Option B)
-    # Sales revenue net of tariff wedge (exporter r loses the wedge on sales into dest)
+    # ---- ULP revenue/cost accounting (LaTeX Option B)
     sales_dom = p[r] * m.x_flow[r, r]
     sales_exp = sum((p[i] - _delta_tar(r, i)) * m.x_flow[r, i] for i in R if i != r)
     sales_rev = sales_dom + sales_exp
 
-    # Real costs borne by exporter r
     man_cost = params.c_mod_man[r] * m.x_man[r]
     dom_use_cost = params.c_mod_dom_use[r] * m.x_flow[r, r]
     ship_cost = sum(m.s_ship[r, i] * m.x_flow[r, i] for i in R if i != r)
 
-    # Tariff revenue collected on imports into r
     tariff_rev = sum(_delta_tar(e, r) * m.x_flow[e, r] for e in R if e != r)
 
     # Market bill for committed demand in r
     demand_bill = p[r] * m.d_offer[r]
 
-    # Penalty for not offering full demand
-    dem_pen = params.c_pen_ulp[r] * m.dem_short
+    # ---- Elastic demand benefit (concave utility)
+    benefit = params.a_dem[r] * m.d_offer[r] - 0.5 * params.b_dem[r] * (m.d_offer[r] ** 2)
 
-    # ---- Fix A: price anchoring to baseline domestic cost
+    # ---- Optional: price anchoring (if you still want it)
     # Reference (constant): p_ref[i] := c_man[i] + c_dom_use[i]
-    p_ref = {i: float(params.c_mod_man[i] + params.c_mod_dom_use[i]) for i in R}
-
-    # Penalize deviations of prices from reference levels (tiny weight!)
-    price_reg = 0.5 * eps_price_reg * sum((p[i] - p_ref[i]) ** 2 for i in R)
+    if eps_price_reg and eps_price_reg > 0.0:
+        p_ref = {i: float(params.c_mod_man[i] + params.c_mod_dom_use[i]) for i in R}
+        price_reg = 0.5 * eps_price_reg * sum((p[i] - p_ref[i]) ** 2 for i in R)
+    else:
+        price_reg = 0.0
 
     m.ULP_OBJ = pyo.Objective(
         expr=(
@@ -155,7 +136,7 @@ def build_player_mpec(
             - ship_cost
             + tariff_rev
             - demand_bill
-            - dem_pen
+            + benefit
             - price_reg
         ),
         sense=pyo.maximize,
