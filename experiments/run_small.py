@@ -26,7 +26,7 @@ if __name__ == "__main__":
 
     # ---- run config (single source of truth) ----
     run_cfg = {
-        "max_iter": 50,
+        "max_iter": 8,
         "tol": 1e-2,
         "damping": 0.8,
         "price_sign": -1.0,
@@ -35,7 +35,7 @@ if __name__ == "__main__":
         "M_dual": 1e6,
         #"kkt_mode": "bigM",     # robust (MIQP)
         "kkt_mode": "bilinear", # no binaries, but nonconvex bilinear equalities
-        "use_shortage_slack": True,
+        "use_shortage_slack": False,
     }
 
 
@@ -69,5 +69,6 @@ if __name__ == "__main__":
     print("\n=== Final theta ===")
     print("q_man:", theta_star.q_man)
     print("d_offer:", theta_star.d_offer)
-    print("T (all arcs):\n" + _fmt_arcs(theta_star.T))
+    print("tau (trade arcs):\n" + _fmt_arcs(theta_star.tau))
+    print("markup (trade arcs):\n" + _fmt_arcs(theta_star.markup))
     print(f"\nSaved Excel results to: {str(xlsx_path)}")

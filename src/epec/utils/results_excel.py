@@ -167,23 +167,40 @@ def save_run_results_excel(
     ws_theta.freeze_panes = "A2"
     _auto_fit_columns(ws_theta)
 
+
     # --- history sheet
     ws_h = wb.create_sheet("history")
 
     # build columns
     base_cols = ["iter", "region", "accepted", "status", "term", "ulp_obj", "llp_obj"]
 
-    region_cols = []
+    # Region-level diagnostics / quantities
+    region_cols: List[str] = []
     for pfx in ["lambda", "pi", "u_short", "nu_ushort", "x_man"]:
         region_cols.extend([f"{pfx}_{r}" for r in R])
 
-    arc_cols = []
-    for pfx in ["x_flow"]:
-        arc_cols.extend([f"{pfx}_{e}_{r}" for (e, r) in RRx])
-    for pfx in ["br_T_in"]:
-        arc_cols.extend([f"{pfx}_{e}_{r}" for (e, r) in RR])
+    # ULP strategic variables snapshot (every iteration)
+    region_cols.extend([f"q_man_{r}" for r in R])
+    region_cols.extend([f"d_offer_{r}" for r in R])
 
-    extra_cols = ["max_u_short"]
+    # Arc-level quantities
+    arc_cols: List[str] = []
+
+    # All flows (including diagonal)
+    arc_cols.extend([f"x_flow_{e}_{r}" for (e, r) in RRx])
+
+    # Strategic trade policy snapshots (Option B)
+    arc_cols.extend([f"tau_{e}_{r}" for (e, r) in RR])
+    arc_cols.extend([f"markup_{e}_{r}" for (e, r) in RR])
+
+    # Best-response decisions for the active player (optional)
+    arc_cols.extend([f"br_tau_in_{e}_{r}" for (e, r) in RR])
+    arc_cols.extend([f"br_m_out_{e}_{r}" for (e, r) in RR])
+
+    # Legacy (optional): keep old columns if present in hist rows
+    arc_cols.extend([f"br_T_in_{e}_{r}" for (e, r) in RR])
+
+    extra_cols = ["max_u_short", "br_q_man", "br_d_offer"]
     cols = base_cols + region_cols + extra_cols + arc_cols
 
     ws_h.append(cols)
@@ -194,6 +211,26 @@ def save_run_results_excel(
 
     ws_h.freeze_panes = "A2"
     ws_h.auto_filter.ref = f"A1:{get_column_letter(len(cols))}1"
+
+    def _theta_snapshot_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
+        """Best-effort extraction of theta snapshots from a history row."""
+        # Preferred: explicitly stored dict snapshots
+        snap = {
+            "q_man": row.get("theta_q_man") or row.get("q_man"),
+            "d_offer": row.get("theta_d_offer") or row.get("d_offer"),
+            "tau": row.get("theta_tau") or row.get("tau"),
+            "markup": row.get("theta_markup") or row.get("markup") or row.get("m"),
+        }
+        # If nothing is present, try a nested Theta object
+        if (snap["q_man"] is None and snap["d_offer"] is None and snap["tau"] is None and snap["markup"] is None):
+            th = row.get("theta") or row.get("theta_star") or row.get("theta_curr")
+            if th is not None:
+                d = _theta_to_dict(th)
+                snap["q_man"] = d.get("q_man")
+                snap["d_offer"] = d.get("d_offer")
+                snap["tau"] = d.get("tau")
+                snap["markup"] = d.get("markup") or d.get("m")
+        return snap
 
     # fill rows
     for row in hist:
@@ -207,18 +244,32 @@ def save_run_results_excel(
         flat["llp_obj"] = _safe_float(row.get("llp_obj"))
         flat["max_u_short"] = _safe_float(row.get("max_u_short"))
 
+        # region-level
         flat.update(_flatten_region_dict("lambda", R, row.get("lambda")))
         flat.update(_flatten_region_dict("pi", R, row.get("pi")))
         flat.update(_flatten_region_dict("u_short", R, row.get("u_short")))
         flat.update(_flatten_region_dict("nu_ushort", R, row.get("nu_ushort")))
         flat.update(_flatten_region_dict("x_man", R, row.get("x_man")))
 
+        # theta snapshots (q_man, d_offer, tau, markup)
+        snap = _theta_snapshot_from_row(row)
+        flat.update(_flatten_region_dict("q_man", R, snap.get("q_man")))
+        flat.update(_flatten_region_dict("d_offer", R, snap.get("d_offer")))
+        flat.update(_flatten_arc_dict("tau", RR, snap.get("tau")))
+        flat.update(_flatten_arc_dict("markup", RR, snap.get("markup")))
+
+        # flows
         flat.update(_flatten_arc_dict("x_flow", RRx, row.get("x_flow")))
+
+        # best-response (optional)
+        flat.update(_flatten_arc_dict("br_tau_in", RR, row.get("br_tau_in")))
+        flat.update(_flatten_arc_dict("br_m_out", RR, row.get("br_m_out")))
         flat.update(_flatten_arc_dict("br_T_in", RR, row.get("br_T_in")))
+        flat["br_q_man"] = _safe_float(row.get("br_q_man"))
+        flat["br_d_offer"] = _safe_float(row.get("br_d_offer"))
 
         ws_h.append([flat.get(c, None) for c in cols])
 
     _auto_fit_columns(ws_h)
-
     wb.save(out_path)
     return out_path

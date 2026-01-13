@@ -52,8 +52,8 @@ def add_llp_kkt_bigM(
         if e == r:
             cost = mm.c_mod_dom_use[r]
         else:
-            # transport + specific tariff
-            cost = mm.s_ship[e, r] + mm.T[e, r]
+            # markup + (shipping * tariff factor)
+            cost = mm.markup[e, r] + mm.tau[e, r] * mm.s_ship[e, r]
         return cost + mm.lam[r] - mm.pi[e] - mm.nu_xflow[e, r] + eps_reg * mm.x_flow[e, r] == 0
 
     m.stat_xflow = pyo.Constraint(m.RRx, rule=_stat_xflow)
@@ -141,7 +141,7 @@ def add_llp_kkt_bilinear(
         if e == r:
             cost = mm.c_mod_dom_use[r]
         else:
-            cost = mm.s_ship[e, r] + mm.T[e, r]
+            cost = mm.markup[e, r] + mm.tau[e, r] * mm.s_ship[e, r]
         return cost + mm.lam[r] - mm.pi[e] - mm.nu_xflow[e, r] + eps_reg * mm.x_flow[e, r] == 0
 
     m.stat_xflow = pyo.Constraint(m.RRx, rule=_stat_xflow)

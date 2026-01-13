@@ -14,35 +14,37 @@ def build_player_mpec(
     sets: Sets,
     params: Params,
     theta_fixed: Theta,
-    price_sign: float = -1.0,
-    eps_reg: float = 1e-6,
+    *,
+    kkt_mode: str = "bigM",
+    eps_reg: float = 1e-7,
+    eps_price_reg: float = 0.5,  # <--- NEW: price anchoring strength (start tiny)
     M_dual: float = 1e6,
-    kkt_mode: str = "bigM",  # "bigM" or "bilinear"
     use_shortage_slack: bool = True,
+    price_sign: float = -1.0,
 ) -> pyo.ConcreteModel:
-    """Build one player's best-response MPEC.
+    """Build the single-player MPEC (ULP_r + embedded LLP-KKT), Option B.
 
-    Player r solves:
-      max Pi_r  s.t.  LLP optimality (KKT) given other players' strategic vars.
+    Player r controls:
+      - d_offer[r] in [0, D_hat[r]]
+      - q_man[r]   in [0, Q_man_hat[r]]
+      - inbound tariff factors tau[e->r] for all e!=r, with 1 <= tau <= tau_ub
+      - outbound markups markup[r->i] for all i!=r, with 0 <= markup <= m_ub
 
-    Economics consistent with the LaTeX baseline:
-      - export earnings at destination price: sum_{i!=r} p_i x_{r,i}
-      - tariff revenue collected by importer r: sum_{e!=r} T_{e->r} x_{e,r}
-      - market bill for committed demand: - p_r d_offer[r]
-      - penalty for lowering offered demand below D_hat (optional): - c_dem_short * max(D_hat - d_offer, 0)
+    All other players' strategic variables are fixed at theta_fixed.
 
-    where p_r := price_sign * lam[r]. (You used price_sign=-1 historically because lam is negative.)
+    Market price in region i is the dual of (MB):  p_i := price_sign * lam[i].
 
-    Notes:
-      - kkt_mode="bigM" gives a MIQP (binaries + bilinear leader terms).
-      - kkt_mode="bilinear" avoids binaries but yields a nonconvex QCP.
-        With Gurobi set NonConvex=2.
+    Price anchoring (Fix A):
+      Adds a tiny penalty to keep prices close to a baseline reference level
+      p_ref[i] := c_mod_man[i] + c_mod_dom_use[i].
+      This prevents the leader from exploiting follower dual non-uniqueness to
+      push lam (and thus prices) to extreme values unrelated to primal costs.
     """
 
-    R, RR = sets.R, sets.RR
     r = region
+    R, RR = sets.R, sets.RR
 
-    # Build LLP primal (strategic variables are Vars here; fixed/bounded below)
+    # ---- build LLP primal (with strategic variables embedded as Vars)
     m = build_llp_primal(
         sets=sets,
         params=params,
@@ -51,9 +53,7 @@ def build_player_mpec(
         use_shortage_slack=use_shortage_slack,
     )
 
-    # ------------------------------------------------------------
-    # Fix other players' strategic vars; free this player's
-    # ------------------------------------------------------------
+    # ---- Fix other players' q_man/d_offer; free this player's
     for s in R:
         if s != r:
             m.q_man[s].fix(theta_fixed.q_man[s])
@@ -62,28 +62,32 @@ def build_player_mpec(
             m.q_man[s].setub(params.Q_man_hat[s])
             m.d_offer[s].setub(params.D_hat[s])
 
-    # Tariffs: player r controls T[e->r] only; all other T fixed
+    # ---- Strategic trade vars (Option B):
+    # tau: importer controls inbound tau[e->r]
+    # markup: exporter controls outbound markup[r->i]
     for (e, dest) in RR:
+        # tau
         if dest == r:
-            m.T[e, dest].setub(params.T_ub[(e, dest)])
+            m.tau[e, dest].setub(params.tau_ub[(e, dest)])
         else:
-            m.T[e, dest].fix(theta_fixed.T[(e, dest)])
+            m.tau[e, dest].fix(theta_fixed.tau[(e, dest)])
 
-    # ------------------------------------------------------------
-    # Tight UBs for primal vars (needed for Big-M; also helps numerics)
-    # ------------------------------------------------------------
+        # markup
+        if e == r:
+            m.markup[e, dest].setub(params.m_ub[(e, dest)])
+        else:
+            m.markup[e, dest].fix(theta_fixed.markup[(e, dest)])
+
+    # ---- Tight UBs for primal vars (needed for Big-M; also helps numerics)
     for s in R:
         m.x_man[s].setub(params.Q_man_hat[s])
         if use_shortage_slack:
             m.u_short[s].setub(params.D_hat[s])
 
     for (e, dest) in sets.RRx:
-        # Flow into region dest cannot exceed its max possible demand cap
         m.x_flow[e, dest].setub(params.D_hat[dest])
 
-    # ------------------------------------------------------------
-    # Add KKT (either Big-M complementarity or bilinear complementarity)
-    # ------------------------------------------------------------
+    # ---- Add KKT (either Big-M complementarity or bilinear complementarity)
     if kkt_mode.lower() == "bilinear":
         add_llp_kkt_bilinear(
             m,
@@ -91,7 +95,6 @@ def build_player_mpec(
             params=params,
             eps_reg=eps_reg,
             use_shortage_slack=use_shortage_slack,
-            dual_bound=M_dual,
         )
     else:
         add_llp_kkt_bigM(
@@ -99,37 +102,62 @@ def build_player_mpec(
             sets=sets,
             params=params,
             eps_reg=eps_reg,
-            use_shortage_slack=use_shortage_slack,
             M_dual=M_dual,
+            use_shortage_slack=use_shortage_slack,
         )
 
     # Deactivate LLP objective; solve leader objective with KKT constraints
     m.LLP_OBJ.deactivate()
 
-    # ------------------------------------------------------------
-    # Leader objective components
-    # ------------------------------------------------------------
-    # Linearize max(D_hat - d_offer, 0)
+    # ---- Linearize (D_hat - d_offer[r]) (always >=0 due to ub, but keeps things explicit)
     m.dem_short = pyo.Var(within=pyo.NonNegativeReals)
     m.dem_short_lb = pyo.Constraint(expr=m.dem_short >= params.D_hat[r] - m.d_offer[r])
 
-    # (1) Export earnings at destination prices (p_i = price_sign*lam[i])
-    export_rev = sum(price_sign * m.lam[i] * m.x_flow[r, i] for i in R if i != r)
+    # ---- Helper: tariff wedge Delta^{tar}_{e->dest} = (tau-1)*s_ship on trade arcs
+    def _delta_tar(e: str, dest: str):
+        return (m.tau[e, dest] - 1.0) * m.s_ship[e, dest]
 
-    # (2) Tariff revenue collected by importer r: sum_e T_{e->r} * x_{e,r}
-    tariff_rev = sum(m.T[e, r] * m.x_flow[e, r] for e in R if e != r)
+    # ---- Prices (buyer prices)
+    p = {i: price_sign * m.lam[i] for i in R}
 
-    # (3) Market bill for committed demand in region r: - p_r * d_offer[r]
-    demand_bill = -price_sign * m.lam[r] * m.d_offer[r]
+    # ---- ULP objective (LaTeX Option B)
+    # Sales revenue net of tariff wedge (exporter r loses the wedge on sales into dest)
+    sales_dom = p[r] * m.x_flow[r, r]
+    sales_exp = sum((p[i] - _delta_tar(r, i)) * m.x_flow[r, i] for i in R if i != r)
+    sales_rev = sales_dom + sales_exp
 
-    # (4) Penalty for lowering offered demand below cap
-    dem_short_pen = params.c_dem_short_ulp[r] * m.dem_short
+    # Real costs borne by exporter r
+    man_cost = params.c_mod_man[r] * m.x_man[r]
+    dom_use_cost = params.c_mod_dom_use[r] * m.x_flow[r, r]
+    ship_cost = sum(m.s_ship[r, i] * m.x_flow[r, i] for i in R if i != r)
 
-    # small regular capacity cost to avoid corner solutions
-    cap_cost = 1e-3 * m.q_man[r]
+    # Tariff revenue collected on imports into r
+    tariff_rev = sum(_delta_tar(e, r) * m.x_flow[e, r] for e in R if e != r)
+
+    # Market bill for committed demand in r
+    demand_bill = p[r] * m.d_offer[r]
+
+    # Penalty for not offering full demand
+    dem_pen = params.c_pen_ulp[r] * m.dem_short
+
+    # ---- Fix A: price anchoring to baseline domestic cost
+    # Reference (constant): p_ref[i] := c_man[i] + c_dom_use[i]
+    p_ref = {i: float(params.c_mod_man[i] + params.c_mod_dom_use[i]) for i in R}
+
+    # Penalize deviations of prices from reference levels (tiny weight!)
+    price_reg = 0.5 * eps_price_reg * sum((p[i] - p_ref[i]) ** 2 for i in R)
 
     m.ULP_OBJ = pyo.Objective(
-        expr=export_rev + tariff_rev + demand_bill - dem_short_pen - cap_cost,
+        expr=(
+            sales_rev
+            - man_cost
+            - dom_use_cost
+            - ship_cost
+            + tariff_rev
+            - demand_bill
+            - dem_pen
+            - price_reg
+        ),
         sense=pyo.maximize,
     )
 

@@ -1,2 +1,4 @@
 $env:PYTHONPATH = "$(pwd)\src"
+
+
 python .\experiments\run_small.py

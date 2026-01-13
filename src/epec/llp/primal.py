@@ -14,70 +14,74 @@ def build_llp_primal(
     eps_reg: float = 1e-6,
     use_shortage_slack: bool = True,
 ) -> pyo.ConcreteModel:
-    """Build the follower (LLP) primal.
+    """Build the follower (LLP) primal (Option B).
 
-    Reformulated LLP (convex QP due to tiny regularization):
+    LLP takes (d_offer, q_man, tau, markup) as given/strategic variables
+    (they are model Vars here, fixed/free by the upper-level player).
 
-    - Unified flow variable x_flow[e,r] for *all* pairs (including diagonal).
-      The diagonal x_flow[r,r] represents domestic use.
-    - Off-diagonal flows pay transport + (specific) import tariff:
-         (s_ship[e,r] + T[e,r]) * x_flow[e,r]
-    - Tariffs T[e,r] are strategic (upper-level) variables (typically fixed except
-      for the currently-optimizing importing region in the Gauss--Seidel loop).
-    - Demand is committed via MB to d_offer[r].
+    Objective (LaTeX Option B):
+      min  sum_r c_man[r]*x_man[r]
+         + sum_r c_dom_use[r]*x_flow[r,r]
+         + sum_{e!=r} ( markup[e,r] + tau[e,r]*s_ship[e,r] ) * x_flow[e,r]
+         + optional shortage penalty (if enabled)
 
-    Optional feasibility safeguard:
-    - shortage slack u_short[r] >= 0 in MB, penalized in LLP by c_pen_llp[r].
-      If total supply is insufficient, the model remains feasible and prices cap
-      near the shortage penalty.
+    Constraints:
+      (MB)  x_flow[r,r] + sum_{e!=r} x_flow[e,r] (+ u_short[r]) = d_offer[r]
+      (PB)  x_man[r] = x_flow[r,r] + sum_{i!=r} x_flow[r,i]
+      (CAP) x_man[r] <= q_man[r]
+      (NN)  nonnegativity
 
-    The objective includes a tiny strictly convex term (eps_reg) to pin down a
-    unique primal (and usually more stable duals).
+    A tiny strictly convex term (eps_reg) is added for numerical stability and
+    to pin down duals in degenerate cases.
     """
 
     R, RR, RRx = sets.R, sets.RR, sets.RRx
 
     m = pyo.ConcreteModel("LLP_Primal")
 
+    # ---- index sets
     m.R = pyo.Set(initialize=R)
     m.RR = pyo.Set(dimen=2, initialize=RR)     # trade arcs (e!=r)
-    m.RRx = pyo.Set(dimen=2, initialize=RRx)   # all pairs (incl. diagonal)
+    m.RRx = pyo.Set(dimen=2, initialize=RRx)   # all pairs (including diagonal)
 
-    # Strategic vars enter LLP as VARIABLES (fixed/bounded in player wrapper)
+    # ---- strategic / upper-level variables (embedded here)
     m.q_man = pyo.Var(m.R, within=pyo.NonNegativeReals, initialize=theta.q_man)
     m.d_offer = pyo.Var(m.R, within=pyo.NonNegativeReals, initialize=theta.d_offer)
-    m.T = pyo.Var(m.RR, within=pyo.NonNegativeReals, initialize=theta.T)
 
-    # Params
+    # multiplicative tariff factor on shipping (>=1) on trade arcs
+    m.tau = pyo.Var(m.RR, within=pyo.Reals, bounds=(1.0, None), initialize=theta.tau)
+    # nonnegative additive markup on trade arcs
+    m.markup = pyo.Var(m.RR, within=pyo.NonNegativeReals, initialize=theta.markup)
+
+    # ---- primal decision variables
+    m.x_man = pyo.Var(m.R, within=pyo.NonNegativeReals, initialize=0.0)
+    m.x_flow = pyo.Var(m.RRx, within=pyo.NonNegativeReals, initialize=0.0)
+
+    # optional feasibility safeguard
+    if use_shortage_slack:
+        m.u_short = pyo.Var(m.R, within=pyo.NonNegativeReals, initialize=0.0)
+
+    # ---- parameters
     m.c_mod_man = pyo.Param(m.R, initialize=params.c_mod_man)
     m.c_mod_dom_use = pyo.Param(m.R, initialize=params.c_mod_dom_use)
     m.s_ship = pyo.Param(m.RR, initialize=params.s_ship)
     m.c_pen_llp = pyo.Param(m.R, initialize=params.c_pen_llp)
 
-    # Primal vars
-    m.x_man = pyo.Var(m.R, within=pyo.NonNegativeReals)
-    m.x_flow = pyo.Var(m.RRx, within=pyo.NonNegativeReals)
-
-    if use_shortage_slack:
-        m.u_short = pyo.Var(m.R, within=pyo.NonNegativeReals)
-
-    # Objective (convex QP)
+    # ---- objective
     def llp_obj(mm: pyo.ConcreteModel):
         man = sum(mm.c_mod_man[r] * mm.x_man[r] for r in mm.R)
-
-        # Domestic use costs on diagonal
         dom = sum(mm.c_mod_dom_use[r] * mm.x_flow[r, r] for r in mm.R)
 
-        # Trade: transport + specific tariff
-        trade = sum((mm.s_ship[e, r] + mm.T[e, r]) * mm.x_flow[e, r] for (e, r) in mm.RR)
+        # imports/trade offers: markup + (shipping * tariff factor)
+        trade = sum((mm.markup[e, r] + mm.tau[e, r] * mm.s_ship[e, r]) * mm.x_flow[e, r] for (e, r) in mm.RR)
 
-        # Optional shortage penalty
+        # optional shortage penalty
         if use_shortage_slack:
             short_pen = sum(mm.c_pen_llp[r] * mm.u_short[r] for r in mm.R)
         else:
             short_pen = 0.0
 
-        # tiny convex regularization (pins down solution/duals)
+        # tiny convex regularization
         reg = 0.5 * eps_reg * (
             sum(mm.x_man[r] ** 2 for r in mm.R)
             + sum(mm.x_flow[e, r] ** 2 for (e, r) in mm.RRx)
@@ -99,11 +103,12 @@ def build_llp_primal(
 
     # (PB) Production balance: manufacturing = domestic use + exports (all outflows)
     def prod_balance(mm: pyo.ConcreteModel, r: str):
-        return mm.x_man[r] == sum(mm.x_flow[r, i] for i in mm.R)
+        outflow = sum(mm.x_flow[r, i] for i in mm.R)  # includes diagonal
+        return mm.x_man[r] == outflow
 
     m.prod_balance = pyo.Constraint(m.R, rule=prod_balance)
 
-    # (CAP) Manufacturing capacity: x_man <= q_man
-    m.man_cap = pyo.Constraint(m.R, rule=lambda mm, r: mm.x_man[r] <= mm.q_man[r])
+    # (CAP) Manufacturing capacity
+    m.cap_man = pyo.Constraint(m.R, rule=lambda mm, r: mm.x_man[r] <= mm.q_man[r])
 
     return m

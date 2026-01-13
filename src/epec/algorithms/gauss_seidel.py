@@ -55,7 +55,8 @@ def _print_player_block(it: int, player: str, m: pyo.ConcreteModel, sets: Sets) 
 
     q_man = {r: _val(m.q_man[r]) for r in R} if hasattr(m, "q_man") else {}
     d_offer = {r: _val(m.d_offer[r]) for r in R} if hasattr(m, "d_offer") else {}
-    T = {(e, r): _val(m.T[e, r]) for (e, r) in RR} if hasattr(m, "T") else {}
+    tau = {(e, r): _val(m.tau[e, r]) for (e, r) in RR} if hasattr(m, "tau") else {}
+    markup = {(e, r): _val(m.markup[e, r]) for (e, r) in RR} if hasattr(m, "markup") else {}
 
     x_man = {r: _val(m.x_man[r]) for r in R} if hasattr(m, "x_man") else {}
     u_short = {r: _val(m.u_short[r]) for r in R} if hasattr(m, "u_short") else {}
@@ -89,9 +90,12 @@ def _print_player_block(it: int, player: str, m: pyo.ConcreteModel, sets: Sets) 
         print("  q_man:", _fmt_map(q_man, key_order=R))
     if d_offer:
         print("  d_offer:", _fmt_map(d_offer, key_order=R))
-    if T:
-        print("  T (specific tariffs, trade arcs):")
-        print(_fmt_arcs(T, arc_order=RR))
+    if tau:
+        print("  tau (tariff factors on shipping, trade arcs):")
+        print(_fmt_arcs(tau, arc_order=RR))
+    if markup:
+        print("  markup (export markups, trade arcs):")
+        print(_fmt_arcs(markup, arc_order=RR))
 
     print("\nLower-level variables / flows:")
     if x_man:
@@ -273,28 +277,37 @@ def solve_gauss_seidel(
                 _print_player_block(it=it, player=r, m=m, sets=sets)
 
             # ---- Best response (Gauss-Seidel update)
-            br_qman = _val(m.q_man[r])
-            br_d = _val(m.d_offer[r])
-            br_T = {(e, r): _val(m.T[e, r]) for e in sets.R if e != r}
+            br_q_man_r   = _val(m.q_man[r])
+            br_d_offer_r = _val(m.d_offer[r])
+
+            # inbound tariffs (chosen by importer r)
+            br_tau_in = {(e, r): _val(m.tau[e, r]) for e in sets.R if e != r}
+
+            # outbound markups (chosen by exporter r)
+            br_m_out = {(r, i): _val(m.markup[r, i]) for i in sets.R if i != r}
 
             def upd(old, new):
                 return old + damping * (new - old)
 
+            # update player scalars
             old_q, old_d = theta.q_man[r], theta.d_offer[r]
-            theta.q_man[r] = upd(theta.q_man[r], br_qman)
-            theta.d_offer[r] = upd(theta.d_offer[r], br_d)
+            theta.q_man[r]   = upd(theta.q_man[r], br_q_man_r)
+            theta.d_offer[r] = upd(theta.d_offer[r], br_d_offer_r)
 
-            max_change = max(
-                max_change,
-                abs(theta.q_man[r] - old_q),
-                abs(theta.d_offer[r] - old_d),
-            )
+            max_change = max(max_change, abs(theta.q_man[r] - old_q), abs(theta.d_offer[r] - old_d))
 
-            for (e, rr) in br_T:
-                old_T = theta.T[(e, rr)]
-                projected_T = max(0.0, min(params.T_ub[(e, rr)], br_T[(e, rr)]))
-                theta.T[(e, rr)] = upd(old_T, projected_T)
-                max_change = max(max_change, abs(theta.T[(e, rr)] - old_T))
+            # update inbound taus into r
+            for (e, rr), newv in br_tau_in.items():
+                oldv = theta.tau[(e, rr)]
+                theta.tau[(e, rr)] = upd(oldv, newv)
+                max_change = max(max_change, abs(theta.tau[(e, rr)] - oldv))
+
+            # update outbound markups from r
+            for (e, i), newv in br_m_out.items():
+                oldv = theta.markup[(e, i)]
+                theta.markup[(e, i)] = upd(oldv, newv)
+                max_change = max(max_change, abs(theta.markup[(e, i)] - oldv))
+
 
             # ---- Store history row (Excel)
             hist.append(
@@ -304,23 +317,28 @@ def solve_gauss_seidel(
                     "accepted": True,
                     "status": str(status),
                     "term": str(tc),
-
                     "ulp_obj": ulp_val,
                     "llp_obj": llp_val,
-
                     "lambda": lam_vals,
                     "pi": pi_vals,
-
                     "u_short": u_short_vals,
                     "nu_ushort": nu_ushort_vals,
                     "max_u_short": max_u_short_val,
-
                     "x_man": x_man_vals,
                     "x_flow": x_flow_vals,
+                    "br_q_man": br_q_man_r,
+                    "br_d_offer": br_d_offer_r,
+                    "br_tau_in": {k: br_tau_in[k] for k in br_tau_in},
+                    "br_m_out": {k: br_m_out[k] for k in br_m_out},
+                    "theta_q_man": dict(theta.q_man),
+                    "theta_d_offer": dict(theta.d_offer),
+                    "theta_tau": dict(theta.tau),
+                    "theta_markup": dict(theta.markup),
+                    "br_q_man": float(br_q_man_r),
+                    "br_d_offer": float(br_d_offer_r),
+                    "br_tau_in": dict(br_tau_in),   # {(e,r): val} inbound for this player
+                    "br_m_out": dict(br_m_out),     # {(r,i): val} outbound for this player
 
-                    "br_q_man": br_qman,
-                    "br_d_offer": br_d,
-                    "br_T_in": {k: br_T[k] for k in br_T},
                 }
             )
 
